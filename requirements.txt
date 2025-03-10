@@ -5,5 +5,6 @@ asyncpg
 python-jose[cryptography]
 passlib[bcrypt]
 pytest
-httpx
 python-multipart
+pytest-asyncio>=0.21.0
+httpx>=0.23.0
