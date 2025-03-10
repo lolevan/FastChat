@@ -6,6 +6,9 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from contextlib import asynccontextmanager
+import os
+
 from app.database import get_db, engine
 from app import models
 from app.connection_manager import manager
@@ -16,16 +19,26 @@ from app.auth import (
     get_current_user
 )
 
-app = FastAPI()
+from pydantic import BaseModel
 
-@app.on_event("startup")
-async def on_startup():
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(models.Base.metadata.create_all)
+    yield
+
+class ChatCreate(BaseModel):
+    name: str
+    user_ids: list[int]
+
+app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 async def root():
     return {"message": "Chat server is running"}
+
 
 # Эндпоинт для создания пользователя
 @app.post("/users/")
@@ -41,6 +54,7 @@ async def create_user(username: str, password: str, db: AsyncSession = Depends(g
     await db.refresh(new_user)
     return {"id": new_user.id, "username": new_user.username}
 
+
 # Эндпоинт для получения JWT токена
 @app.post("/token")
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
@@ -50,11 +64,12 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
+
 # Эндпоинт для создания группового чата
 @app.post("/chats/")
-async def create_chat(name: str, user_ids: list[int] = Body(...), db: AsyncSession = Depends(get_db)):
-    new_chat = models.Chat(name=name)
-    result = await db.execute(select(models.User).where(models.User.id.in_(user_ids)))
+async def create_chat(chat: ChatCreate, db: AsyncSession = Depends(get_db)):
+    new_chat = models.Chat(name=chat.name)
+    result = await db.execute(select(models.User).where(models.User.id.in_(chat.user_ids)))
     users = result.scalars().all()
     if not users:
         raise HTTPException(status_code=404, detail="Users not found")
@@ -63,6 +78,7 @@ async def create_chat(name: str, user_ids: list[int] = Body(...), db: AsyncSessi
     await db.commit()
     await db.refresh(new_chat)
     return {"id": new_chat.id, "name": new_chat.name}
+
 
 # WebSocket-эндпоинт для обмена сообщениями
 @app.websocket("/ws/{chat_id}")
