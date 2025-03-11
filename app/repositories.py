@@ -18,6 +18,7 @@ class UserRepository:
         result = await self.db.execute(select(User).where(User.username == username))
         return result.scalar_one_or_none()
 
+
 class ChatRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
