@@ -5,6 +5,7 @@ from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
 
+
 class ChatType(str, enum.Enum):
     personal = "personal"
     group = "group"
@@ -17,6 +18,7 @@ chat_users = Table(
     Column('user_id', Integer, ForeignKey('users.id'), primary_key=True)
 )
 
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -27,6 +29,7 @@ class User(Base):
     chats = relationship("Chat", secondary=chat_users, back_populates="users")
     messages = relationship("Message", back_populates="sender")
 
+
 class Chat(Base):
     __tablename__ = "chats"
     id = Column(Integer, primary_key=True, index=True)
@@ -36,6 +39,7 @@ class Chat(Base):
 
     users = relationship("User", secondary=chat_users, back_populates="chats")
     messages = relationship("Message", back_populates="chat")
+
 
 class Message(Base):
     __tablename__ = "messages"

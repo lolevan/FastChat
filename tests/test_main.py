@@ -18,6 +18,7 @@ async def async_client():
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
 
+
 @pytest.mark.asyncio
 async def test_create_user_and_get_token(async_client: AsyncClient):
     # Создание пользователя
@@ -38,6 +39,7 @@ async def test_create_user_and_get_token(async_client: AsyncClient):
     assert response.status_code == 200
     token_data = response.json()
     assert "access_token" in token_data
+
 
 @pytest.mark.asyncio
 async def test_create_chat(async_client: AsyncClient):

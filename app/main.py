@@ -1,12 +1,10 @@
 import json
-import datetime
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Body
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from app.database import get_db, engine
 from app import models
@@ -17,11 +15,14 @@ from app.auth import (
     create_access_token,
     get_current_user
 )
+from app.services import UserService, ChatService, MessageService
+
 
 # Pydantic-модель для создания чата
 class ChatCreate(BaseModel):
     name: str
     user_ids: list[int]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,53 +32,46 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
 @app.get("/")
 async def root():
     return {"message": "Chat server is running"}
 
+
 @app.post("/users/")
-async def create_user(username: str, email: str, password: str, db: AsyncSession = Depends(get_db)):
-    hashed_password = get_password_hash(password)
-    new_user = models.User(username=username, email=email, password=hashed_password)
-    db.add(new_user)
+async def create_user(username: str, email: str, password: str, db=Depends(get_db)):
+    user_service = UserService()
     try:
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail="Username or email already exists")
-    await db.refresh(new_user)
-    return {"id": new_user.id, "username": new_user.username, "email": new_user.email}
+        user = await user_service.create_user(db, username, email, get_password_hash(password))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"id": user.id, "username": user.username, "email": user.email}
+
 
 @app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
     user = await authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect username or password")
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
+
 @app.post("/chats/")
-async def create_chat(chat: ChatCreate, db: AsyncSession = Depends(get_db)):
-    new_chat = models.Chat(name=chat.name, type=models.ChatType.group, creator_id=chat.user_ids[0])
-    result = await db.execute(select(models.User).where(models.User.id.in_(chat.user_ids)))
-    users = result.scalars().all()
-    if not users:
-        raise HTTPException(status_code=404, detail="Users not found")
-    new_chat.users = users
-    db.add(new_chat)
-    await db.commit()
-    await db.refresh(new_chat)
+async def create_chat(chat: ChatCreate, db=Depends(get_db)):
+    chat_service = ChatService()
+    try:
+        # Используем первого пользователя из списка как создателя
+        new_chat = await chat_service.create_chat(db, chat.name, chat.user_ids, creator_id=chat.user_ids[0])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"id": new_chat.id, "name": new_chat.name, "type": new_chat.type.value}
 
+
 @app.get("/history/{chat_id}")
-async def get_history(chat_id: int, limit: int = 50, offset: int = 0, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(models.Message).where(models.Message.chat_id == chat_id)
-        .order_by(models.Message.created_at.asc())
-        .offset(offset)
-        .limit(limit)
-    )
-    messages = result.scalars().all()
+async def get_history(chat_id: int, limit: int = 50, offset: int = 0, db=Depends(get_db)):
+    chat_service = ChatService()
+    messages = await chat_service.get_history(db, chat_id, limit, offset)
     return [
         {
             "id": msg.id,
@@ -90,20 +84,19 @@ async def get_history(chat_id: int, limit: int = 50, offset: int = 0, db: AsyncS
         for msg in messages
     ]
 
+
 @app.post("/messages/{message_id}/read")
-async def mark_message_read(message_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(models.Message).where(models.Message.id == message_id))
-    message = result.scalar_one_or_none()
-    if not message:
-        raise HTTPException(status_code=404, detail="Message not found")
-    message.is_read = True
-    await db.commit()
-    # Здесь можно добавить уведомление отправителя через WebSocket
+async def mark_message_read(message_id: int, db=Depends(get_db)):
+    message_service = MessageService()
+    try:
+        await message_service.mark_read(db, message_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
     return {"message": "Message marked as read"}
 
+
 @app.websocket("/ws/{chat_id}")
-async def websocket_endpoint(websocket: WebSocket, chat_id: int, db: AsyncSession = Depends(get_db)):
-    # Получение токена из query-параметров
+async def websocket_endpoint(websocket: WebSocket, chat_id: int, db=Depends(get_db)):
     token = websocket.query_params.get("token")
     if token is None:
         await websocket.close(code=1008)
@@ -115,6 +108,17 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, db: AsyncSessio
         return
     user_id = user.id
 
+    # Проверка, является ли пользователь участником чата:
+    result = await db.execute(
+        select(models.Chat)
+        .options(selectinload(models.Chat.users))
+        .where(models.Chat.id == chat_id)
+    )
+    chat = result.scalar_one_or_none()
+    if not chat or user_id not in [u.id for u in chat.users]:
+        await websocket.close(code=1008)
+        return
+
     await manager.connect(chat_id, websocket)
     try:
         while True:
@@ -125,54 +129,40 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, db: AsyncSessio
                 await websocket.send_json({"error": "Invalid message format"})
                 continue
 
-            # Если сообщение содержит действие "read", обновляем статус сообщения
+            # Обработка события прочтения
             if message_data.get("action") == "read":
                 message_id = message_data.get("message_id")
                 if message_id is None:
                     await websocket.send_json({"error": "Missing message_id for read action"})
                     continue
-                result = await db.execute(select(models.Message).where(models.Message.id == message_id))
-                message = result.scalar_one_or_none()
-                if message:
-                    message.is_read = True
-                    try:
-                        await db.commit()
-                    except IntegrityError:
-                        await db.rollback()
-                        await websocket.send_json({"error": "Error updating message read status"})
-                        continue
-                    # Отправляем уведомление всем участникам (или только отправителю, если нужно)
-                    notification = {"action": "read_update", "message_id": message_id, "is_read": True}
-                    await manager.broadcast(chat_id, notification)
-                continue  # Пропускаем дальнейшую обработку для этого цикла
+                message_service = MessageService()
+                try:
+                    await message_service.mark_read(db, message_id)
+                except Exception as e:
+                    await websocket.send_json({"error": str(e)})
+                    continue
+                notification = {"action": "read_update", "message_id": message_id, "is_read": True}
+                await manager.broadcast(chat_id, notification)
+                continue
 
-            # Если обычное текстовое сообщение, обрабатываем его
             text = message_data.get("text")
             if not text:
                 await websocket.send_json({"error": "No text provided"})
                 continue
 
+            # Предотвращаем дублирование сообщений
             current_time = time.time()
             if manager.is_duplicate(chat_id, user_id, text, current_time):
                 await websocket.send_json({"error": "Duplicate message detected"})
                 continue
 
-            new_message = models.Message(
-                chat_id=chat_id,
-                sender_id=user_id,
-                text=text,
-                created_at=datetime.datetime.utcnow(),
-                is_read=False
-            )
-            db.add(new_message)
+            message_service = MessageService()
             try:
-                await db.commit()
-            except IntegrityError:
-                await db.rollback()
-                await websocket.send_json({"error": "Error saving message"})
+                new_message = await message_service.create_message(db, chat_id, user_id, text)
+            except Exception as e:
+                await websocket.send_json({"error": "Error saving message: " + str(e)})
                 continue
 
-            await db.refresh(new_message)
             message_to_send = {
                 "id": new_message.id,
                 "chat_id": chat_id,
